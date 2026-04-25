@@ -1,0 +1,11 @@
+# Problem-statement screenshots (excluded from public repo)
+*.jpeg
+*.jpg
+*.png
+
+# Windows/WSL zone identifiers
+*:Zone.Identifier
+*:sec.endpointdlp
+
+# Local tooling state
+.omc/
