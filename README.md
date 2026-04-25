@@ -232,10 +232,15 @@ Extract signals from the alert and assign an initial severity with a calibrated 
 ```
 - **User prompt template**:
 ```
-Alert description: {{input.alert_description}}
-Structured signals: product_id={{input.product_id}}, location_id={{input.location_id}}, time_sensitivity={{input.time_sensitivity}}, severity_hint={{input.severity_hint}}
+Disruption alert received:
+"""
+{{raw_alert_text}}
+"""
+Additional structured fields provided by the source system:
+- Source type: {{source_type}}
+- Timestamp: {{timestamp}}
 
-Extract and return JSON with exactly these fields:
+Parse and return the normalised disruption object with exactly these fields:
 - product_id, location_id, alert_type
 - time_sensitivity (0-1)
 - demand_hint: stable | increasing | surge | unknown
