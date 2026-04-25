@@ -24,9 +24,8 @@ RetailCo receives disruption alerts and must:
 
 | Principle | Where it lives in the workflow |
 |---|---|
-| Human-in-the-loop | `Human Handoff` only as **fallback** — after 2 failed auto-revisions, on REJECT verdict, or for structural confidence failures |
-| Adversarial self-revision (no human) | `Evaluator Guardrail` emits APPROVE / **ITERATE with actionable suggestions** / REJECT. ITERATE loops back to `[10]` with suggestions appended — bounded by `retry_count < 2` |
-| Adversarial self-review | `Evaluator Guardrail` after each enrichment iteration AND after the final recommendation |
+| Human-in-the-loop | `Human Handoff` only as **fallback** — after exhausted auto-revisions, on REJECT verdict, or for structural confidence failures |
+| Adversarial self-review + self-revision | `Evaluator Guardrail` at each enrichment iteration, after scoring, and after the final recommendation. Emits APPROVE / **ITERATE with actionable suggestions** / REJECT. ITERATE loops back to the upstream node with suggestions appended — bounded by hard retry caps (1 on score, 2 on recommendation) |
 | Confidence gating | `Classifier Router` + loop break + pre-escalation `Condition Branch` |
 | Fail-safe tool use | `Retry Fallback` wrapping every `Knowledge Retrieval` |
 | Structured I/O | `Prompt Template` + `Output Formatter` with strict JSON |
@@ -189,11 +188,9 @@ flowchart TD
 2. **[4A.check] demotion edge** is the recovery path for a wrong initial CRIT hypothesis. Without it, the fast-confirm lane would rubber-stamp bad triage. The demotion back into [5] means we re-derive severity from real signals instead of acting on the guess.
 3. **The Loop's break edge goes to Merge Join, not directly to Score.** This keeps aggregation explicit — Merge Join is the single point where the enrichment trace becomes the input context for [7]. Scoring reads one bundle, not a streamed history.
 4. **[7.eval] + [7.5] Router** give the severity score its own self-revision loop — a single retry. Severity is the most-cascading decision in the flow (it gates both the resource check and the action), so auditing it cheaply before committing avoids large downstream corrections.
-5. **[8] skips [9] when severity < HIGH**. This is the *resource-awareness* principle inverted — don't even ask about resources if you're not about to recommend anything that consumes them. Saves an API call and keeps the rationale honest.
-6. **[11] + [11.5] ITERATE edge loops back to [10], not further upstream.** Deliberate scoping: the adversary on the recommendation can only demand a different *action* given the same signals. If it wants different signals, that's a REJECT and the flow escalates to Human Handoff. Keeps retry loops bounded and local.
-7. **Every loopback (Sanity retry, Score ITERATE, Rec ITERATE) has an integer retry counter and a hard cap.** No uncapped self-correction.
-8. **Human Handoff is a shared terminal**, always joining [12] after. The final output schema is produced exactly once, whether the path was fully automated or human-reviewed. `human_review: bool` in the JSON records which.
-9. **Four guardrails at four different stakes**: free deterministic check at [2.check], cheap LLM break decision in the loop, mid-cost LLM score audit, full LLM recommendation adversary. Guardrails are *proportional to the cost of being wrong* at each stage.
+5. **[11] + [11.5] ITERATE edge loops back to [10], not further upstream.** Deliberate scoping: the adversary on the recommendation can only demand a different *action* given the same signals. If it wants different signals, that's a REJECT and the flow escalates to Human Handoff. Keeps retry loops bounded and local.
+6. **Every loopback (Sanity retry, Score ITERATE, Rec ITERATE) has an integer retry counter and a hard cap.** No uncapped self-correction.
+7. **Four guardrails at four different stakes**: free deterministic check at [2.check], cheap LLM break decision in the loop, mid-cost LLM score audit, full LLM recommendation adversary. Guardrails are *proportional to the cost of being wrong* at each stage.
 
 ---
 
@@ -715,14 +712,9 @@ Both nodes read from the shared workflow context/state object. The LLM Triage no
 - Custom Code would only be needed if a downstream node had a different numeric scale (0–100 vs 0–1). Enforcing one scale in the Triage prompt removes that need.
 - **Design note**: keep the scale contract at the top of every prompt (`confidence: 0.0–1.0`) so prompts are self-documenting and agents don't drift.
 
-### Q2. Evaluator Guardrail → Human Handoff: direct edge or via Condition Branch?
-**Route through an explicit Condition Branch.**
-Architectural reasons:
-1. **Explainability (success criterion #9)**: an explicit `Condition Branch` node makes the human-handoff trigger *visible on the diagram*, which matters more than saving a node.
-2. **Separation of concerns**: Evaluator Guardrail's job is to *judge* (`approved`, `requires_human`, `reason`). Routing is a separate concern and belongs to a branch node.
-3. **Builder portability**: some builders' Guardrail node emits only a JSON verdict (no `on_fail` edge). Condition Branch is universal.
-4. **Auditability**: every hand-off decision becomes a logged branch event, not a hidden guardrail side-effect.
-- **Pattern**: `Evaluator Guardrail` → `Condition Branch (requires_human == true)` → **true edge** → `Human Handoff` → `[12]`; **false edge** → `[12]` directly.
+### Q2. Evaluator Guardrail → Human Handoff: direct edge or routed?
+**Route through an explicit Classifier Router.** The Guardrail judges (`verdict`, `requires_human`, `suggestions`), the Router decides. Separating the two gives three advantages the Guardrail-direct-edge pattern can't: explainability (routing is visible on the diagram), builder portability (some builders' Guardrails only emit a JSON verdict with no `on_fail` edge), and auditability (every hand-off becomes a logged branch event).
+- **Pattern**: `Evaluator Guardrail` → `Classifier Router` with three outcomes (`APPROVE_OUT`, `ITERATE_OUT`, `HUMAN_OUT`). Guardrail at [11], Router at [11.5]. Same pattern at [7.eval] + [7.5] for the score loop.
 
 ### Q3. Parallel API call inside one Knowledge Retrieval node (for [4A])?
 **Use two sequential Knowledge Retrieval nodes. Parallel fan-out is an optional optimisation.**
@@ -730,35 +722,3 @@ Architectural reasons:
 - HIGH-lane [4A] calls are *confirmatory* (cheap, fast) — total latency from two sequential calls is acceptable and keeps the pipeline linear (success criterion #8).
 - **Optional optimisation** if the builder supports fan-out: split into two parallel `Retry Fallback → Knowledge Retrieval` branches, merge them at a `Merge Join` before [7]. Use only if latency budget is tight.
 - **Design note**: sequential is the portable default; document the parallel variant in comments for future optimisation without rewriting the flow.
-
----
-
-## 10. Architecture notes (added after resolving open questions)
-
-- **Single source of confidence**: every LLM node must emit `confidence` on the same 0–1 scale. Do not rename (no `score`, `certainty`, etc.). Enforce in prompts.
-- **Trace is append-only**: every node appends one entry to the `trace` array. Never rewrite. This makes the final `rationale[]` derivable by a pure transform in [12], not reconstructed by an LLM.
-- **Explicit branches over implicit side-effects**: any change in control flow must traverse a visible Classifier Router or Condition Branch node — never inside a Guardrail or LLM step.
-- **Retry Fallback contract**: on API failure, return `{error: true, api: "<name>", reason: "..."}` so the loop can continue, the Evaluator Guardrail can see the gap, and the final rationale honestly reports missing signals.
-- **Idempotent loop**: the loop's iteration controller must not re-select an API already present in `apis_called[]`. Enforce in the selector prompt (rules 1–6 are ordered and exclusive).
-- **Human Handoff is terminal to the auto-path**: after Human Handoff, the flow always joins [12] so the final output schema is produced exactly once per invocation.
-
----
-
-## 11. Critic review log (ITERATE → APPROVE pending)
-
-Adversarial critic pass against the v1 plan returned **ITERATE** with 3 critical findings. Each has been applied to the plan above.
-
-| # | Finding | Fix applied |
-|---|---|---|
-| C1 | `LANE_HIGH` required all three flags aligned — real CRIT alerts with `time_sensitivity=0.5` fell into the 6-step loop, defeating the "selective API" criterion. | [3] Router: `LANE_HIGH = CRIT OR (HIGH AND time_sensitivity>0.7 AND stockout_hint=true)`. |
-| C2 | Loop idempotence was asserted in prose but not enforced in the selector prompt — the selector could re-pick an API whose hint became known on a prior iteration. | [5] prompt now takes `{{apis_called}}` and includes a HARD RULE: "NEVER return an api already in apis_called". |
-| M1 | Explainability was LLM-assembled in [12] from prose trace — fragile and narratable, not derivable. | [12] replaced with Custom Code that maps `scoring.contributing_signals[]` → `rationale[]` verbatim. Deterministic. |
-| M2 | Severity clamp was `1..4` but `priority` was `1..5`, and LOW+all-amplifiers couldn't cross into HIGH — contradicts repeat-escalation criterion. | [7] clamp raised to `1..5`, priority = raw score, severity map `1→LOW 2→MED 3→HIGH 4→CRIT 5→CRIT`. |
-| M3 | Q2 resolution (route Guardrail→Handoff via Condition Branch) was in Section 9 but not in the diagram or [11] description. | Added [11.5] Condition Branch to both the diagram and the node catalog. |
-| gap | [4A] had no disconfirmation path — a wrong initial CRIT hypothesis would rubber-stamp through to [7]. | Added [4A.check] Condition Branch: if Inventory/Demand disconfirm, demote to [5]. |
-| gap | [7] did not handle `{error:true}` from Retry Fallback — missing signals would be silently treated as absent. | [7] prompt now flags missing signals explicitly and reduces confidence by 0.15 per missing critical signal. |
-| gap | Human handoff did not fire on low triage confidence for HIGH/CRIT cases. | [11] `requires_human` rule extended: `OR (triage.confidence < 0.5 AND final_severity in [HIGH,CRIT])`. |
-
-### Minor items still open (acceptable)
-- API name string consistency is enforced by the trace transform in [12] — use canonical names (`DemandSignal`, `Inventory`, `RegionalImportance`, `DisruptionHistory`, `AlternativeAvailability`, `SupplyChainStatus`, `ResourceAvailability`) everywhere.
-- Loop max-iterations = 6 leaves no slack for an `{error:true}` retry. If the builder counts retries as iterations, raise Loop max to 8.
