@@ -29,7 +29,7 @@ RetailCo receives disruption alerts and must:
 | Confidence gating | `Classifier Router` + loop break + pre-escalation `Condition Branch` |
 | Fail-safe tool use | `Retry Fallback` wrapping every `Knowledge Retrieval` |
 | Structured I/O | `Prompt Template` + `Output Formatter` with strict JSON |
-| Explainability-by-construction | Every node appends `{api, why, signal, delta_to_severity}` to a running `trace` |
+| Explainability-by-construction | Every node appends to a running `trace` — see §4.0 Block A schema |
 | Selective tool use | Router picks lane; loop breaks early on confidence ≥ 0.8 |
 | Least-privilege escalation | Resource Availability API is only called when severity ≥ HIGH |
 
@@ -214,6 +214,48 @@ Each node block below uses builder-ready fields. Copy the values straight into t
 
 ---
 
+### [4.0] State-writer contracts
+
+**Block A — `trace[]` entry writers (append-only)**
+
+Schema:
+```
+trace[i] = {
+  type: "triage" | "api_call" | "eval" | "score" | "rec",
+  step: "<node_id>",
+  api: "<name|null>",
+  why: "<1-line|null>",
+  result_summary: "<1-line|null>",
+  delta_to_severity: "+1" | "0" | "-1" | null,
+  pass_index: <int|null>,
+  error: true|false   (api_call only; omitted elsewhere)
+}
+```
+
+Writers:
+- `type=triage` — [2] only. `step="[2]"`, `why=<reasoning>`, others null.
+- `type=api_call` — Retry-Fallback wrapper around every KR ([4A.1], [4A.2], [5.kr], [9]). Fields: `step`, `api`, `why`, `result_summary`, `error`. On `error=true`, entry still appended.
+- `type=eval` — every Guardrail ([5.eval], [7.eval], [11]). Fields: `step`, `why=verdict`, `result_summary=counterexample_or_issues_join`, `pass_index=retry_count_before`.
+- `type=score` — [7] only. `step="[7]"`, `pass_index` (from `$.score_retry` at entry), `delta_to_severity=null`, `result_summary=score_reasoning`.
+- `type=rec` — [10] only. `step="[10]"`, `pass_index` (from `$.rec_retry` at entry), `result_summary=action`.
+
+**Block B — State-variable writers (non-trace)**
+
+| Name | Writer node | Semantics | Initial |
+|---|---|---|---|
+| `score_revision_notes` | [7.5] on ITERATE | overwrite | `""` |
+| `revision_notes` | [11.5] on ITERATE | overwrite | `""` |
+| `apis_called[]` | Retry-Fallback wrapper on KR success | append-controlled (single-writer) | `[]` |
+| `signals.*` | each KR via its Retry-Fallback wrapper (one field per API) | single-write per field | absent |
+| `$.score_retry` | [7.5] on ITERATE (increment by 1) | overwrite | `0` |
+| `$.rec_retry` | [11.5] on ITERATE (increment by 1) | overwrite | `0` |
+| `$.triage_retry` | [2.check] on RETRY_TRIAGE (increment by 1) | overwrite | `0` |
+| `pass_index` (on type:score/type:rec trace entries) | [7] and [10] — read `$.score_retry`/`$.rec_retry` at entry, stamp into new trace entry | derived-per-write | n/a |
+
+**`apis_called[]` contract**: single writer = Retry-Fallback wrapper on SUCCESS only. On `error=true`, wrapper appends trace entry but NOT to `apis_called[]`. [12] READS `apis_called[]` — it does NOT rebuild from trace.
+
+---
+
 ### [1] Input
 - **Type**: Input
 - **Fields**: `alert_description` (text), `product_id`, `location_id`, `time_sensitivity` (0–1), `severity_hint` (LOW|MED|HIGH|CRIT)
@@ -247,7 +289,7 @@ Parse and return the normalised disruption object with exactly these fields:
 - initial_severity: LOW | MED | HIGH | CRIT
 - confidence: 0.0-1.0
 - reasoning: one short line
-- trace: [{"step":"triage","note":"..."}]
+- trace: [{"type":"triage","step":"[2]","api":null,"why":"<reasoning>","result_summary":null,"delta_to_severity":null,"pass_index":null}]
 ```
 - **Output classes**: `product_id, location_id, alert_type, time_sensitivity, demand_hint, stockout_hint, repeat_hint, strategic_location_hint, initial_severity, confidence, reasoning, trace`
 - **Notes**: No API calls here. Confidence scale is 0–1 everywhere in this workflow — do not rename to `score` or `certainty`.
@@ -269,7 +311,7 @@ elif fail_reasons:                    route = "HANDOFF"
 else:                                 route = "PASS"
 ```
 - **Output classes**: `PASS, RETRY_TRIAGE, HANDOFF`
-- **Notes**: Deterministic gate. Cheapest guardrail in the flow — catches garbage triage before it wastes API calls. Retries triage once before escalating to human.
+- **Notes**: Deterministic gate. Cheapest guardrail in the flow — catches garbage triage before it wastes API calls. Retries triage once before escalating to human. Counter: `$.triage_retry` (integer, cap=1, increment site=[2.check], exhaustion destination=Human Handoff, reset=per-alert).
 
 ---
 
@@ -295,12 +337,12 @@ Return only the label. No prose.
 ### [4A.1] Knowledge Retrieval — Inventory (HIGH lane)
 - **Type**: Knowledge Retrieval (wrapped in Retry Fallback)
 - **Datasource (API)**: `Inventory API` — returns `current_stock`, `stockout_risk` (low/medium/high/confirmed), `days_of_cover`
-- **Notes**: Confirmatory call only. On retry-fallback error returns `{error: true, api: "Inventory"}` — downstream score will flag as unavailable.
+- **Notes**: Confirmatory call only. On retry-fallback error returns `{error: true, api: "Inventory"}` — downstream score will flag as unavailable. On KR success, Retry-Fallback wrapper appends `{type:"api_call", step, api, why:"confirm CRIT hypothesis", result_summary}` to `trace` and appends api to `apis_called[]` (see §4.0). On `{error:true}`, wrapper appends api_call entry with `error:true` and does NOT append to `apis_called[]`.
 
 ### [4A.2] Knowledge Retrieval — Demand Signal (HIGH lane)
 - **Type**: Knowledge Retrieval (wrapped in Retry Fallback)
 - **Datasource (API)**: `Demand Signal API` — returns `demand_level`, `demand_trend` (stable/increasing/surge)
-- **Notes**: Sequential after [4A.1]; portable default. Switch to parallel + Merge Join only if the builder supports fan-out.
+- **Notes**: Sequential after [4A.1]; portable default. Switch to parallel + Merge Join only if the builder supports fan-out. On KR success, Retry-Fallback wrapper appends `{type:"api_call", step, api, why:"confirm CRIT hypothesis", result_summary}` to `trace` and appends api to `apis_called[]` (see §4.0). On `{error:true}`, wrapper appends api_call entry with `error:true` and does NOT append to `apis_called[]`.
 
 ### [4A.check] Condition Branch — Confirm CRIT hypothesis
 - **Type**: Condition Branch
@@ -310,14 +352,24 @@ inventory.stockout_risk in ["high", "confirmed"] OR demand.demand_trend == "surg
 ```
 - **Output classes**: `CONFIRMED, DISCONFIRMED`
 - **Routing**: `CONFIRMED` → [7]; `DISCONFIRMED` → [5] (demote into enrichment loop).
-- **Notes** (critic gap fix): prevents the HIGH lane from rubber-stamping a wrong initial CRIT hypothesis. Demoting forces severity to be re-derived from retrieved signals.
+- **Notes** (critic gap fix): prevents the HIGH lane from rubber-stamping a wrong initial CRIT hypothesis. Demoting forces severity to be re-derived from retrieved signals. On both CONFIRMED and DISCONFIRMED edges, `signals.stockout_risk`, `signals.demand_trend`, and `apis_called=["Inventory","Demand Signal"]` are populated before routing. On DISCONFIRMED → [5.select], rules 1 and 2 are no-ops (hints known); execution proceeds to rule 3 (RegionalImportance).
 
 ---
 
 ### [4B] Early-Exit (LOW lane) → goes straight to [12]
 - **Type**: Prompt Template (static — sets fixed recommendation fields)
-- **Output**: `final_severity=LOW, priority=1, recommended_action="monitor", apis_called=[], rationale=[{"api":null,"why":"clear-cut low-impact; APIs skipped by design","signal":"triage hints stable+low time sensitivity","impact":"no amplification"}]`
-- **Notes**: Zero APIs called. This is the proof that the workflow honours the selective-API constraint for obvious low-impact cases.
+- **Output**:
+```
+severity=LOW, priority=1, recommended_action="monitor",
+confidence=<triage.confidence>, apis_called=[],
+rationale=[{api:null, why:"clear-cut low-impact; APIs skipped by design",
+            signal:"triage hints stable + low time sensitivity",
+            delta_to_severity:"0"}],
+resource_plan={uses:"n/a", fallback:"n/a"},
+human_review=false,
+trace_summary="LOW lane early-exit; 0 APIs consulted"
+```
+- **Notes**: Zero APIs called. This is the proof that the workflow honours the selective-API constraint for obvious low-impact cases. [4B] emits the full §12 schema (all 9 keys) directly. `EarlyExit --> Output` is a permitted bypass: [12] is a no-op on that edge.
 
 ---
 
@@ -362,7 +414,7 @@ Return ONLY one of:
 #### [5.kr] Knowledge Retrieval — Dynamic API
 - **Type**: Knowledge Retrieval (wrapped in Retry Fallback)
 - **Datasource (API)**: **one of** `Demand Signal API | Inventory API | Regional Importance API | Disruption History API | Alternative Availability API | Supply Chain Status API` — chosen at runtime by `next_api` from [5.select].
-- **Notes**: In most builders this requires either a parameterised Knowledge Retrieval node, or 6 small Knowledge Retrieval branches chosen via a Condition Branch. If your builder can't parameterise, fan out and merge.
+- **Notes**: See §8 for parameterised-KR capability assumption.
 
 #### [5.eval] Evaluator Guardrail — Loop break decision (adversary)
 - **Type**: Evaluator Guardrail
@@ -471,7 +523,7 @@ Return only the label.
 ```
 - **Output classes**: `SCORE_OK, SCORE_REVISE, SCORE_HANDOFF`
 - **Routing**: `SCORE_OK` → [8]; `SCORE_REVISE` → increment `score_retry_count`, write suggestions into `score_revision_notes`, loop back to [7]; `SCORE_HANDOFF` → Human Handoff → [12].
-- **Notes**: Retry budget = 1. Scoring drift usually fixes in one pass; more means model confusion → escalate.
+- **Notes**: Retry budget = 1. Scoring drift usually fixes in one pass; more means model confusion → escalate. **Notes semantics**: `score_revision_notes` is **overwritten (not appended)** on each retry. The retry loop is memoryless beyond the last evaluator output. Full history reconstructible via `pass_index` on type:score trace entries. Counter: `$.score_retry` (integer, cap=1, increment site=[7.5], exhaustion destination=Human Handoff via SCORE_HANDOFF, reset=per-alert).
 
 ---
 
@@ -556,6 +608,7 @@ Return STRICT JSON:
 Rules:
 - ITERATE → suggestions MUST be non-empty and actionable.
 - APPROVE → suggestions = [].
+- If triage.confidence < 0.7 AND final_severity in [HIGH,CRIT] AND retry_count < 2 → verdict = "ITERATE" with suggestion {target:"action", change:"re-derive severity from retrieved signals; triage confidence insufficient for HIGH/CRIT without amplifier reconciliation"}.
 - requires_human = true ONLY if:
     action == "human_review"
     OR (final_severity in [HIGH,CRIT] AND verdict == "REJECT")
@@ -563,7 +616,7 @@ Rules:
     OR (retry_count >= 2 AND verdict != "APPROVE")
 ```
 - **Output classes**: `verdict, issues, suggestions, requires_human, reason`
-- **Notes**: Emits verdict only. Routing is [11.5]'s job so the decision stays visible on the diagram.
+- **Notes**: Emits verdict only. Routing is [11.5]'s job so the decision stays visible on the diagram. The object returned by [11] is bound to state as `final_evaluator`. All downstream references use `final_evaluator.*`.
 
 ### [11.5] Classifier Router — Adversary outcome gate
 - **Type**: Classifier Router
@@ -571,17 +624,56 @@ Rules:
 ```
 Route based on evaluator.verdict, retry_count, and requires_human.
 
-APPROVE_OUT : evaluator.verdict == "APPROVE"
-ITERATE_OUT : evaluator.verdict == "ITERATE" AND retry_count < 2 AND evaluator.requires_human == false
-HUMAN_OUT   : evaluator.requires_human == true
-              OR evaluator.verdict == "REJECT"
-              OR (evaluator.verdict == "ITERATE" AND retry_count >= 2)
+APPROVE_OUT : final_evaluator.verdict == "APPROVE"
+ITERATE_OUT : final_evaluator.verdict == "ITERATE" AND retry_count < 2 AND final_evaluator.requires_human == false
+HUMAN_OUT   : final_evaluator.requires_human == true
+              OR final_evaluator.verdict == "REJECT"
+              OR (final_evaluator.verdict == "ITERATE" AND retry_count >= 2)
 
 Return only the label.
 ```
 - **Output classes**: `APPROVE_OUT, ITERATE_OUT, HUMAN_OUT`
-- **Routing**: `APPROVE_OUT` → [12]; `ITERATE_OUT` → increment `retry_count`, write `evaluator.suggestions` into `revision_notes`, loop back to [10]; `HUMAN_OUT` → Human Handoff → [12].
-- **Notes**: Adversarial self-revision before HITL. Hard cap `retry_count < 2` prevents infinite bounce. Humans are reserved for structural failures or exhausted retries.
+- **Routing**: `APPROVE_OUT` → [12]; `ITERATE_OUT` → increment `retry_count`, write `final_evaluator.suggestions` into `revision_notes`, loop back to [10]; `HUMAN_OUT` → Human Handoff → [12].
+- **Notes**: Adversarial self-revision before HITL. Hard cap `retry_count < 2` prevents infinite bounce. Humans are reserved for structural failures or exhausted retries. **Notes semantics**: `revision_notes` is **overwritten (not appended)** on each retry. The retry loop is memoryless beyond the last evaluator output. Full history reconstructible via `pass_index` on type:rec trace entries. Counter: `$.rec_retry` (integer, cap=2, increment site=[11.5], exhaustion destination=Human Handoff via HUMAN_OUT, reset=per-alert).
+
+---
+
+### [H.pre] Handoff pre-fill (Custom Code, deterministic)
+- **Type**: Custom Code
+- **Pseudocode**:
+```
+# Runs on every edge entering [H]. Pre-fills only absent fields.
+if recommendation is undefined:
+    recommendation = {
+        action: "human_review",
+        justification: "handoff pre-fill",
+        resource_plan: {uses: "n/a", fallback: "human"},
+        confidence: 0,
+        addressed_suggestions: []
+    }
+if score is undefined:
+    score = {
+        final_severity: triage.initial_severity,
+        priority: 1,
+        confidence: triage.confidence,
+        score_reasoning: "handoff pre-fill — scoring skipped",
+        contributing_signals: []
+    }
+if final_evaluator is undefined:
+    final_evaluator = {
+        requires_human: true,
+        reason: "handoff entered before final review",
+        verdict: null,
+        suggestions: [],
+        issues: []
+    }
+```
+- **Notes**: Three entry paths:
+  - `[2.check] → HANDOFF`: synthesizes all three.
+  - `[7.5] → SCORE_HANDOFF`: synthesizes `recommendation` + `final_evaluator` (score exists).
+  - `[11.5] → HUMAN_OUT`: synthesizes nothing ([10], [7], [11] all ran).
+
+  [12]'s `human_review = final_evaluator.requires_human` is true on every Handoff path under this contract. Every Handoff edge routes through [H.pre] before [H]. (Mermaid diagram above retains the simpler `Handoff --> Output` edge for readability; the [H.pre] step is logical-only and a follow-up diagram update is permitted.)
 
 ---
 
@@ -592,7 +684,7 @@ Return only the label.
 Disruption requires human review.
 Alert: {{input.alert_description}}
 Severity: {{score.final_severity}} (confidence {{score.confidence}})
-Why flagged: {{evaluator.reason}}
+Why flagged: {{final_evaluator.reason}}
 APIs used so far: {{apis_called}}
 Suggested action: {{recommendation.action}} — resources: {{recommendation.resource_plan}}
 Please approve, override, or request more data.
@@ -613,10 +705,11 @@ for entry in trace where entry.type == "api_call":
         "api": entry.api,
         "why": entry.why,
         "signal": matching[0].signal if matching else entry.result_summary,
-        "impact": matching[0].delta if matching else "0"
+        "delta_to_severity": matching[0].delta if matching else "0"
     })
 
-apis_called = [entry.api for entry in trace if entry.type == "api_call"]
+# apis_called is READ from state (populated by Retry-Fallback wrappers per §4.0 Block B).
+# Do NOT rebuild from trace.
 
 output = {
     "severity": scoring.final_severity,
@@ -626,7 +719,7 @@ output = {
     "apis_called": apis_called,
     "rationale": rationale,
     "resource_plan": recommendation.resource_plan,
-    "human_review": evaluator.requires_human,
+    "human_review": final_evaluator.requires_human,
     "trace_summary": scoring.score_reasoning
 }
 ```
@@ -643,7 +736,7 @@ output = {
       "api": "Demand",
       "why": "check demand trend before escalating",
       "signal": "surge",
-      "impact": "+1 severity"
+      "delta_to_severity": "+1"
     }
   ],
   "resource_plan": {"uses": "...", "fallback": "..."},
@@ -654,15 +747,17 @@ output = {
 
 ---
 
-## 5. Decision thresholds (single source of truth)
+## 5. Decision thresholds (canonical — mirrors §4 prompts; resolve conflicts in §4's favour)
 
 | Gate | Threshold |
 |---|---|
 | Loop break (enough info) | confidence ≥ 0.8 OR all 6 APIs consulted |
-| Classifier HIGH lane | severity=CRIT AND time_sensitivity>0.8 AND stockout_hint=true |
-| Classifier LOW lane | severity=LOW AND time_sensitivity<0.3 AND demand=stable AND no repeat |
+| Classifier HIGH lane | `initial_severity=="CRIT" OR (initial_severity=="HIGH" AND time_sensitivity>0.7 AND stockout_hint==true)` (see §4 [3] line 282-289) |
+| Classifier LOW lane | `initial_severity=="LOW" AND time_sensitivity<0.3 AND demand_hint=="stable" AND repeat_hint==false` (see §4 [3] line 282-289) |
 | Resource check gate | final_severity ∈ {HIGH, CRIT} |
 | Human handoff | action=human_review OR (HIGH/CRIT AND evaluator not approved) |
+| Adversary iterate floor | triage.confidence < 0.7 AND final_severity in [HIGH,CRIT] (see §4 [11]) |
+| Adversary handoff floor | triage.confidence < 0.5 AND final_severity in [HIGH,CRIT] (see §4 [11]) |
 
 ---
 
@@ -677,7 +772,7 @@ output = {
 | 5 | Repeat escalation | [7] +1 on repeat ≥ 2 (DisruptionHistory) |
 | 6 | Demand + region amplify | [7] +1 on surge OR strategic |
 | 7 | Resource check before act | [8] gates [9] before [10] |
-| 8 | Linear pipeline + checkpoints | Router, Loop Evaluator, [8], [11] |
+| 8 | Bounded self-revision with named checkpoints | [2.check] ($.triage_retry cap 1), [5.eval], [7.eval]/[7.5] ($.score_retry cap 1), [11]/[11.5] ($.rec_retry cap 2) |
 | 9 | Structured rationale | [12] schema with per-API influence |
 
 ---
@@ -690,12 +785,22 @@ output = {
 | Minor logistics delay, stable demand, small store | LOW | (none) | monitor |
 | Moderate delay at medium store, history unknown | AMBIG | Demand → Inventory → DisruptionHistory (break on repeat=3) | escalate |
 | HIGH severity confirmed but zero escalation capacity | AMBIG → HIGH | …+ Resource | human_review (Human Handoff) |
+| Scorer omits repeat amplifier, recovers on ITERATE | AMBIG | Demand, Inventory, DisruptionHistory | escalate ($.score_retry=1) |
+| CRIT boundary: t=0.72, stockout_hint=unknown | HIGH | Inventory, Demand | escalate |
+| Score REJECT → Handoff pre-fill | any | as-dictated | human_review (via [H.pre]) |
+| Sanity retry-exhaust → Handoff pre-fill | n/a | none | human_review ($.triage_retry=1) |
+
+### 7.1 Staging-replay observability (not production metrics)
+- **O1 Adversary mode-collapse gate**: On a staging replay of ≥100 heterogeneous alerts, if any of [5.eval]/[7.eval]/[11] emits `ITERATE` or `REJECT` on fewer than 5% of runs, re-prompt that evaluator or assign it a distinct LLM instance from the others. Mode-collapse (all-APPROVE) invalidates adversarial review.
+- **O2 apis_called invariant**: `apis_called.length == trace.filter(e => e.type=="api_call" && !e.error).length` must hold on every run. Violation indicates single-writer rule breach.
+- **O3 Handoff invariant**: `human_review == true` iff the trace contains a path through `[H]`.
+- **O4 Minimum trace fields** per entry type: triage={step,why}; api_call={step,api,why,result_summary,error}; eval={step,why,result_summary,pass_index}; score={step,pass_index,result_summary}; rec={step,pass_index,result_summary}.
 
 ---
 
 ## 8. Assumptions
 
-- Knowledge Retrieval node supports per-call API selection via parameter.
+- **Knowledge Retrieval supports per-call API selection via parameter** (single canonical location). If not supported, [5.kr] and [9] degrade to a Condition-Branch fan-out of one KR-per-API merged before the downstream node. **Pre-Handoff Custom Code step is supported by the builder** (required by [H.pre]).
 - Loop node exposes iteration count and accumulator (for `trace`).
 - Evaluator Guardrail can route control flow (break / continue / handoff).
 - Retry Fallback triggers on API error and returns a typed `{error:true}` object so the loop continues gracefully.
@@ -720,5 +825,4 @@ Both nodes read from the shared workflow context/state object. The LLM Triage no
 **Use two sequential Knowledge Retrieval nodes. Parallel fan-out is an optional optimisation.**
 - Most builders bind one Knowledge Retrieval node to one tool/API.
 - HIGH-lane [4A] calls are *confirmatory* (cheap, fast) — total latency from two sequential calls is acceptable and keeps the pipeline linear (success criterion #8).
-- **Optional optimisation** if the builder supports fan-out: split into two parallel `Retry Fallback → Knowledge Retrieval` branches, merge them at a `Merge Join` before [7]. Use only if latency budget is tight.
-- **Design note**: sequential is the portable default; document the parallel variant in comments for future optimisation without rewriting the flow.
+- **See §8.**
